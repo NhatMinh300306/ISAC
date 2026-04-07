@@ -53,11 +53,17 @@ class VideoEncoder:
             encoded_header = encoded_header.T.flatten()
         else:
             encoded_header = encoded_header.flatten()
+            
+        # Interleave payload to scatter erasures (packet loss) uniformly 
+        # across the image making it globally visible but noisy, instead of cropped.
+        torch.manual_seed(999)
+        self.payload_interleave_idx = torch.randperm(len(payload_bits))
+        payload_bits = payload_bits[self.payload_interleave_idx]
         
         total_bits = torch.cat([encoded_header, payload_bits])
         return total_bits, header_len
 
-    def decode(self, rx_bits, header_len, num_frames, frame_size=(16,16)):
+    def decode(self, rx_bits, header_len, num_frames, frame_size=(32,32)):
         enc_header_len = (header_len // 4) * 7
         rx_header_flat = rx_bits[:enc_header_len]
         rx_payload = rx_bits[enc_header_len:]
@@ -75,6 +81,17 @@ class VideoEncoder:
         
         corrected_header = (rx_header + self.err_matrix[syn_dec]) % 2
         decoded_header = corrected_header[:, :4].flatten()
+        
+        # De-interleave payload
+        expected_payload_len = len(self.payload_interleave_idx)
+        if len(rx_payload) < expected_payload_len:
+            # Pad with 1s rather than 0s to enforce a harsh visual penalty (white static) instead of dark blending
+            rx_payload = torch.cat([rx_payload, torch.ones(expected_payload_len - len(rx_payload), dtype=torch.int64)])
+        elif len(rx_payload) > expected_payload_len:
+            rx_payload = rx_payload[:expected_payload_len]
+            
+        inverse_idx = torch.argsort(self.payload_interleave_idx)
+        rx_payload = rx_payload[inverse_idx]
         
         final_bits = torch.cat([decoded_header, rx_payload])
         
@@ -128,12 +145,20 @@ class ISACChannel:
         # Hf [Nr, Nt, Nfft, Nsym]
         Hf = generate_multipath_ofdm_channel(self.tx_array, self.rx_array, self.ofdm_cfg.Nfft, num_syms, self.mpc, self.ofdm_cfg.subcarrier_spacing)
         
+        # Calculate Omni-directional reference power for fair noise floor
+        clean_rx_grid_omni = self.channel(tx_grid)
+        from isac.utils import measure_batch_sig_pow
+        omni_pow_lin = measure_batch_sig_pow(clean_rx_grid_omni).item()
+        omni_pow_db = 10 * np.log10(max(omni_pow_lin, 1e-30))
+        
         if W is not None:
             # W: [Nt, Nt], tx_grid can be [1, Nt, Nsc, Nsym]
-            tx_grid = torch.einsum('ij, ...jcs->...ics', W, tx_grid)
+            tx_grid_bf = torch.einsum('ij, ...jcs->...ics', W, tx_grid)
+        else:
+            tx_grid_bf = tx_grid
             
-        clean_rx_grid = self.channel(tx_grid)
-        awgn = AWGNChannel(snr_db=snr_db)
+        clean_rx_grid = self.channel(tx_grid_bf)
+        awgn = AWGNChannel(snr_db=snr_db, sigpow_db=omni_pow_db)
         rx_grid = awgn(clean_rx_grid)
         return rx_grid, Hf
 
@@ -290,17 +315,19 @@ def run_high_fidelity_simulation():
     total_payload_bits = len(encoded_bits)
     
     bits_per_sym = num_tx * num_data_carrs * 2
-    # To create a true trade-off, we fix the total size of the OFDM frame.
-    # Higher pilot ratios will reduce Nd (data symbols), physically forcing
-    # lower throughput and resulting in partial frame transmission (distortion).
-    total_ofdm_syms = int(np.ceil(total_payload_bits / bits_per_sym)) + 20
+    
+    # We increase the frame size to 32x32 and allocate exactly 100 symbols total space.
+    # At total=100: PR=0.1 has Np=10 (perfect channel estimation), Nd=90 (Cap > Payload).
+    # PR=0.5 has Np=50 (massive sensing power), Nd=50 (Cap < Payload => Drops ~12% bits natively).
+    min_data_syms = int(np.ceil(total_payload_bits / bits_per_sym))
+    total_ofdm_syms = 100
     
     snrs = [0, 5, 10, 15, 20, 25]
     pilot_ratios = [0.1, 0.2, 0.3, 0.5]
     
     # We choose an SNR where the physical throughput limitation of the 
     # sensing-centric PR=0.5 case is starkly visible vs the comm-centric one.
-    capture_snr = 15
+    capture_snr = 25
     
     pareto_results = []
     ber_fec_results = {'uncoded': [], 'fec': []}
@@ -332,7 +359,9 @@ def run_high_fidelity_simulation():
             pad = data_cap_bits - len(encoded_bits)
             tx_data_bits = torch.cat([encoded_bits, torch.zeros(pad, dtype=torch.int64)])
         else:
-            tx_data_bits = encoded_bits[:data_cap_bits]
+            tx_data_bits = torch.zeros(data_cap_bits, dtype=torch.int64)
+            tx_data_bits[:data_cap_bits] = encoded_bits[:data_cap_bits]
+            
             
         # Modulate data (symbol-consecutive mapping to group pixel errors)
         d_syms = qpsk_mod(
@@ -375,6 +404,7 @@ def run_high_fidelity_simulation():
         # Sensing Action
         rx_sens_p = rx_raw[0, :, :, :Np].flatten(start_dim=1)
         try:
+            # We use MDL to estimate subspace order natively 
             order = estimate_subspace_order(rx_sens_p.unsqueeze(0), method='mdl')[0].item()
             est_aoas = sensing.estimate_aoa_root_music(rx_sens_p, min(order, len(true_aoas)))
             aoa_rmse = sensing.calculate_rmse(true_aoas, est_aoas)
@@ -388,7 +418,7 @@ def run_high_fidelity_simulation():
         if len(det_bits) >= len(encoded_bits):
             rx_bits = det_bits[:len(encoded_bits)]
         else:
-            rx_bits = torch.cat([det_bits, torch.zeros(len(encoded_bits) - len(det_bits), dtype=torch.int64)])
+            rx_bits = torch.cat([det_bits, torch.ones(len(encoded_bits) - len(det_bits), dtype=torch.int64)])
             
         return rx_bits, aoa_rmse
 
